@@ -47,29 +47,30 @@ clientapp = "kffl.app.client_app:app"
 # Number of full KFFL iterations (each iteration = 3 message rounds)
 num-server-rounds = 10
 # Dimension of the random feature maps (D)
-num-random-features = 64
+num-random-features = 64 # 10
 # Step size for the proximal gradient update
-step-size = 0.05
+step-size = 0.01
 # Fairness regularization weight
-lambda = 2000.0
+lambda = 0
 # RBF kernel bandwidth for sensitive-attribute ORF
 gamma-s = 1.0
 # RBF kernel bandwidth for model-prediction ORF
 gamma-f = 1.0
 # Dataset to federate (must be a key in kffl.data._DATASET_REGISTRY)
-dataset = "no_sensitive"
+# "adult", "toy", "no_sensitive"
+dataset = "adult"
 # Comma-separated sensitive attribute column names (default: dataset-specific, e.g. "sex,race")
-sensitive-features = "group"
+sensitive-features = "sex"
 # Model architecture (must be a key in kffl.ml._MODEL_REGISTRY)
 model = "logistic"
 # Number of output classes for the model
 num-classes = 2
 # Number of federated clients / data partitions (must match num-supernodes)
-num-partitions = 3
+num-partitions = 4
 # Batch size for local DataLoaders
 batch-size = 64
 # Proximal step-size α for local update: L = f_i(ω) + (1/2α)||ω − ω_{t+1/2}||²
-proximal-alpha = 2 
+proximal-alpha = 0.01
 # Number of local Adam epochs per KFFL round
 num-local-epochs = 5
 
@@ -77,4 +78,4 @@ num-local-epochs = 5
 default = "local-simulation"
 
 [tool.flwr.federations.local-simulation]
-options.num-supernodes = 3
+options.num-supernodes = 4

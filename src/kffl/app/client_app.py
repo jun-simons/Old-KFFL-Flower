@@ -151,24 +151,24 @@ def _compute_fair2_gradient(
     seed: int,
     device: str = "cpu",
 ) -> List[np.ndarray]:
-    """Compute the local fairness gradient gᵢ(ω) = J_{Ωᵢ}(ω)ᵀ G(ω).
+    """Compute the local fairness gradient g_i(ω) = J_{Omega_i}(ω)^T G(ω).
 
     Uses autograd to differentiate
 
-        h(ω) = tr(Ωᵢ(ω)ᵀ G) = ⟨Ωᵢ(ω), G⟩_F
+        h(ω) = tr(Omega_i(ω)^T G) = ⟨Omega_i(ω), G⟩_F
 
     with respect to model parameters ω, where
 
-        Ωᵢ(ω) = Mᵢ(ω) - nᵢ · µ_s · µ_fᵀ                    (eq. 15)
-        Mᵢ(ω)  = Z_{S,i}ᵀ Z_{f,i}(ω)                          (eq. 14)
+        Ωᵢ(ω) = M_i(ω) - n_i · mu_s · mu_f^T (TODO this may be incorrect)   (eq. 15)
+        Mᵢ(ω)  = Z_{S,i}^T Z_{f,i}(ω)                          (eq. 14)
 
-    Here µ_s and µ_f are the **global** aggregated means from the server
-    (computed during FAIR1 and passed as constants).  They do not depend on ω,
-    so only Mᵢ(ω) contributes to the Jacobian.
-
+    mu_s and mu_f are the **global** aggregated means from the server
+    (computed during FAIR1 and passed as constants)
+    TODO: check on whether one or both of these should be the local mean for Omega_i
+    
     The ORF weights (W_f, b_f) are re-derived from *seed+1* identically to
-    FAIR1, ensuring the feature maps are consistent between rounds.
-
+    FAIR1
+    
     Parameters
     ----------
     loader:
@@ -199,19 +199,21 @@ def _compute_fair2_gradient(
     X_all, S_all = _collect_data(loader, dev)
     ni = S_all.shape[0]
 
-    # ---- ORF for S (same seed as FAIR1, no gradient needed) ----
+    # ---- ORF for S (same seed as FAIR1) ----
+    # TODO: see if we want to cache this on a client instead
     orf_s = OrthogonalRandomFeaturesRBF(gamma=gamma_s, n_components=D, random_state=seed)
     Z_S_np = orf_s.fit_transform(S_all)                        # (n, D)
     Z_S = torch.as_tensor(Z_S_np, dtype=torch.float32, device=dev)
 
-    # ---- Global µ_s and µ_f from server (constants, no gradient) ----
+    # ---- Global mu_s and mu_f from server----
+    # note: these are constants, so no gradient from autograd
+    # if we use these to compute Omega_i, the centering term has no gradient
     mu_s = torch.as_tensor(mu_s_global, dtype=torch.float32, device=dev)  # (D,)
     mu_f = torch.as_tensor(mu_f_global, dtype=torch.float32, device=dev)  # (D,)
 
     # ---- ORF weights for f(X) (seed+1, same as FAIR1) ----
     # We only need the projection matrices W_ and b_, which depend solely on
-    # f_dim, D, gamma_f, and seed — NOT on data values.  Fitting on a zero
-    # placeholder of the right shape gives identical W_/b_ to FAIR1.
+    # f_dim, D, gamma_f, and seed 
     with torch.no_grad():
         f_probe = model.proba_for_orf(X_all[:1])               # type: ignore[attr-defined]
     f_dim = f_probe.shape[1]
@@ -231,12 +233,22 @@ def _compute_fair2_gradient(
     proj = f_X @ W_f.T + b_f.unsqueeze(0)                    # (n, D)
     Z_f = scale * torch.cos(proj)                             # (n, D)
 
-    Mi = Z_S.T @ Z_f                                          # (D, D)
-    Omega_i = Mi - ni * torch.outer(mu_s, mu_f)              # (D, D)
+    # Mi = Z_S.T @ Z_f                                          # (D, D)
+    # Omega_i = Mi - ni * torch.outer(mu_s, mu_f)              # (D, D)
+    #
+    # G_t = torch.as_tensor(G, dtype=torch.float32, device=dev)
+    # h = (Omega_i * G_t).sum()                                 # scalar: ⟨omega_i G⟩_F
+    #
+    # h.backward()
+
+    Mi = Z_S.T @ Z_f                      # (D, D)
+    mu_f_i = Z_f.mean(dim=0)              # (D,), gradient-enabled
+    mu_s_global_t = torch.as_tensor(mu_s_global, dtype=torch.float32, device=dev)
+
+    Omega_i = Mi - ni * torch.outer(mu_s_global_t, mu_f_i)
 
     G_t = torch.as_tensor(G, dtype=torch.float32, device=dev)
-    h = (Omega_i * G_t).sum()                                 # scalar: ⟨Ωᵢ, G⟩_F
-
+    h = (Omega_i * G_t).sum()
     h.backward()
 
     # ---- Collect per-parameter gradients ----
@@ -298,13 +310,13 @@ def handle_fair1(message: Message, context: Context) -> Message:
 
 @app.query("fair2")
 def handle_fair2(message: Message, context: Context) -> Message:
-    """Compute local fairness gradient gᵢ(ω_t) and return to server.
+    """Compute local fairness gradient g_i(ω_t) and return to server.
 
     Equations (15) and (16) from the paper:
-        Ωᵢ(ω) = Mᵢ(ω) − nᵢ · µ_{s,i} · µ_{f,i}ᵀ
-        gᵢ(ω)  = J_{Ωᵢ}(ω)ᵀ G(ω)
+        Ωᵢ(ω) = M_i(ω) - n_i · mu_{s,i} · µ_{f,i}^T
+        gᵢ(ω)  = J_{Omega_i}(ω)^T G(ω)
     """
-    crec: ConfigRecord = message.content["config"]  # type: ignore[index]
+    crec: ConfigRecord = message.content["config"]
     seed = int(crec["seed"])
     D = int(crec["num_rf"])
     gamma_s = float(crec["gamma_s"])
@@ -312,7 +324,7 @@ def handle_fair2(message: Message, context: Context) -> Message:
 
     model = _extract_model(message)
 
-    arec: ArrayRecord = message.content["fair2_data"]  # type: ignore[index]
+    arec: ArrayRecord = message.content["fair2_data"]
     G = arec["G"].numpy().astype(np.float64)           # (D, D)
     mu_s_global = arec["mu_s"].numpy().astype(np.float64)  # (D,)
     mu_f_global = arec["mu_f"].numpy().astype(np.float64)  # (D,)
