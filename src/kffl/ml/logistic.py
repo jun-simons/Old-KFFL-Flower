@@ -5,7 +5,7 @@ Architecture:
   Binary case uses BCEWithLogitsLoss; multiclass uses CrossEntropyLoss.
 
 Training:
-  ``train()`` runs SGD (or Adam) for a configurable number of local epochs,
+  ``train()`` runs Adam for a configurable number of local epochs,
   optionally adding a proximal penalty  (μ/2)·‖ω − ω_center‖² that pulls the
   model toward the half-step ω_{t+1/2} received from the server (eq. 21).
 """
@@ -63,7 +63,7 @@ class LogisticRegression(nn.Module):
         return out.squeeze(1) if self._binary else out
 
     def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
-        """Return probabilities (no gradient).
+        """Return probabilities (no gradient)
 
         Returns
         -------
@@ -79,7 +79,7 @@ class LogisticRegression(nn.Module):
 
         Unlike ``predict_proba``, this method does not disable gradient
         computation so the result can be used as an intermediate in an
-        autograd graph.
+        autograd graph
 
         Returns
         -------
@@ -168,7 +168,7 @@ def train(
     criterion: nn.Module = (
         nn.BCEWithLogitsLoss() if model._binary else nn.CrossEntropyLoss()
     )
-    optimizer = torch.optim.SGD(
+    optimizer = torch.optim.Adam(
         model.parameters(), lr=lr, weight_decay=weight_decay
     )
 

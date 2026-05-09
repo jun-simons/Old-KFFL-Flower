@@ -19,9 +19,11 @@ Each KFFL iteration consists of three message rounds per global update:
 from __future__ import annotations
 
 from logging import INFO
-from typing import List
+from typing import Dict, List, Optional
 
 import numpy as np
+import torch
+from scipy.stats import ks_2samp
 
 from flwr.app import Array, ArrayRecord, ConfigRecord, Context, Message, RecordDict
 from flwr.serverapp import Grid, ServerApp
@@ -76,6 +78,87 @@ def _model_config_record(
 
 
 # ---------------------------------------------------------------------------
+# Evaluation metrics
+# ---------------------------------------------------------------------------
+
+
+def _compute_metrics(
+    model,
+    dataset_name: str,
+    num_partitions: int,
+    batch_size: int,
+    sensitive_features: Optional[List[str]],
+) -> Dict[str, float]:
+    """Compute RMSE and KS distance on the full (reconstructed) dataset.
+
+    Loads all client partitions and concatenates them so the server has
+    a global view of predictions vs labels and sensitive groups.
+
+    Metrics
+    -------
+    rmse:
+        Root mean squared error of predicted probabilities vs true labels.
+        Lower is better; a random model gives ~0.5 on balanced data.
+
+    ks:
+        KS distance — the maximum over all pairs (s, s') of sensitive groups
+        of  sup_t |F^s(t; ω) − F^s'(t; ω)|,  where F^s is the empirical CDF
+        of model predictions for group s (eq. 5–6 of the paper).
+        Zero means identical prediction distributions across groups.
+
+    acc:
+        Classification accuracy (threshold 0.5).
+    """
+    loaders = get_federated_loaders(
+        dataset_name,
+        num_partitions=num_partitions,
+        batch_size=batch_size,
+        sensitive_features=sensitive_features,
+        shuffle=False,
+    )
+
+    all_preds: List[np.ndarray] = []
+    all_y:     List[np.ndarray] = []
+    all_s:     List[np.ndarray] = []
+
+    model.eval()
+    with torch.no_grad():
+        for loader in loaders:
+            for X_batch, y_batch, s_batch in loader:
+                preds = model.predict_proba(X_batch)        # (batch,) for binary
+                if preds.ndim > 1:
+                    preds = preds[:, 1]                     # P(y=1) for multiclass
+                all_preds.append(preds.cpu().numpy())
+                all_y.append(y_batch.numpy())
+                all_s.append(s_batch.numpy())               # (batch, k)
+
+    preds_np = np.concatenate(all_preds).astype(np.float64)  # (n,)
+    y_np     = np.concatenate(all_y).astype(np.float64)      # (n,)
+    s_np     = np.concatenate(all_s)                          # (n, k)
+
+    # RMSE of predicted probabilities vs binary labels
+    rmse = float(np.sqrt(np.mean((preds_np - y_np) ** 2)))
+
+    # Accuracy
+    acc = float(np.mean((preds_np >= 0.5) == y_np))
+
+    # KS distance: max over all sensitive attribute columns and all group pairs
+    ks_max = 0.0
+    k = s_np.shape[1]
+    for col in range(k):
+        groups = np.unique(s_np[:, col])
+        for i, g1 in enumerate(groups):
+            for g2 in groups[i + 1:]:
+                p1 = preds_np[s_np[:, col] == g1]
+                p2 = preds_np[s_np[:, col] == g2]
+                if len(p1) > 0 and len(p2) > 0:
+                    ks_stat, _ = ks_2samp(p1, p2)
+                    ks_max = max(ks_max, ks_stat)
+
+    return {"rmse": rmse, "ks": ks_max, "acc": acc}
+
+
+# ---------------------------------------------------------------------------
 # Main server loop
 # ---------------------------------------------------------------------------
 
@@ -98,9 +181,18 @@ def main(grid: Grid, context: Context) -> None:
     proximal_alpha: float = float(context.run_config.get("proximal-alpha", 1.0))
     num_local_epochs: int = int(context.run_config.get("num-local-epochs", 1))
 
+    # Optional comma-separated sensitive feature names (e.g. "sex" or "sex,race")
+    sens_raw = context.run_config.get("sensitive-features", None)
+    sensitive_features = (
+        [s.strip() for s in str(sens_raw).split(",") if s.strip()]
+        if sens_raw is not None
+        else None   # use dataset-specific default
+    )
+
     # --- Derive input_dim from one sample batch ---
     sample_loader = get_federated_loaders(
-        dataset_name, num_partitions=num_partitions, batch_size=1
+        dataset_name, num_partitions=num_partitions, batch_size=1,
+        sensitive_features=sensitive_features,
     )[0]
     X_sample, _, _ = next(iter(sample_loader))
     input_dim: int = X_sample.shape[1]
@@ -169,7 +261,7 @@ def main(grid: Grid, context: Context) -> None:
         )
 
         # ------------------------------------------------------------------ #
-        # FAIR2: collect local fairness gradients                             #
+        # FAIR2: collect local fairness gradients                            #
         # ------------------------------------------------------------------ #
         fair2_content = RecordDict({
             "config": model_cfg,
@@ -187,7 +279,7 @@ def main(grid: Grid, context: Context) -> None:
             len(fair2_replies), len(node_ids),
         )
 
-        # Sum per-parameter gradients: Σᵢ gᵢ
+        # Sum per-parameter gradients: sumᵢ gᵢ
         sum_grad = [np.zeros_like(w, dtype=np.float64) for w in get_weights(model)]
         n_valid = 0
         for reply in fair2_replies:
@@ -201,21 +293,24 @@ def main(grid: Grid, context: Context) -> None:
 
         grad_norm = float(np.sqrt(sum(np.sum(g ** 2) for g in sum_grad)))
 
-        # ω_{t+1/2} = ω_t − η · λ · Σᵢ gᵢ
+        hsic_scale = 2.0 / max(total_n - 1, 1) ** 2
         omega_half_weights = [
-            w - step_size * lambda_fair * g
+            w - step_size * lambda_fair * hsic_scale * g
             for w, g in zip(get_weights(model), sum_grad)
         ]
 
+        scaled_grad_norm = float(np.sqrt(sum(
+            np.sum((hsic_scale * g) ** 2) for g in sum_grad
+        )))
         half_norm = float(np.sqrt(sum(np.sum(w ** 2) for w in omega_half_weights)))
         logger.log(
             INFO,
-            "[Server] FAIR2: n_valid=%d  ||Σgᵢ||=%.4f  ||ω_{t+1/2}||=%.4f",
-            n_valid, grad_norm, half_norm,
+            "[Server] FAIR2: n_valid=%d  ||∇HSIC||=%.6f  hsic_scale=%.2e  ||ω_{t+1/2}||=%.4f",
+            n_valid, scaled_grad_norm, hsic_scale, half_norm,
         )
 
         # ------------------------------------------------------------------ #
-        # Local Update: clients perform proximal gradient step (stub)         #
+        # Local Update: clients perform proximal gradient step       #
         # ------------------------------------------------------------------ #
         local_cfg = ConfigRecord({
             "round_num": t,
@@ -255,8 +350,16 @@ def main(grid: Grid, context: Context) -> None:
             set_weights(model, avg_weights)
 
         new_norm = float(np.sqrt(sum(np.sum(w ** 2) for w in get_weights(model))))
+
+        metrics = _compute_metrics(
+            model, dataset_name, num_partitions, batch_size, sensitive_features
+        )
         logger.log(
-            INFO, "[Server] Round %d complete.  ||ω_{t+1}||=%.4f", t + 1, new_norm
+            INFO,
+            "[Server] Round %d complete.  ||ω_{t+1}||=%.4f"
+            "  acc=%.4f  rmse=%.4f  ks=%.4f",
+            t + 1, new_norm,
+            metrics["acc"], metrics["rmse"], metrics["ks"],
         )
 
     logger.log(INFO, "[Server] KFFL finished after %d round(s).", num_rounds)

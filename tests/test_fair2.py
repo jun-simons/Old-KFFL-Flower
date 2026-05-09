@@ -454,15 +454,34 @@ class TestFair2Variants:
 
 
 # ======================================================================
-# Server-side aggregation (ω_{t+1/2} = ω_t − η·λ·Σᵢ gᵢ)
+# Server-side aggregation: ω_{t+1/2} = ω_t − η·λ·(2/n²)·Σᵢ gᵢ
 # ======================================================================
 
 
+def _server_half_step(
+    weights: List[np.ndarray],
+    sum_grad: List[np.ndarray],
+    total_n: int,
+    step_size: float,
+    lambda_fair: float,
+) -> List[np.ndarray]:
+    """Replicate the server's FAIR2 half-step update (with HSIC normalization)."""
+    hsic_scale = 2.0 / max(total_n, 1) ** 2
+    return [
+        w - step_size * lambda_fair * hsic_scale * g
+        for w, g in zip(weights, sum_grad)
+    ]
+
+
 class TestFair2ServerAggregation:
-    """Verify the half-step update formula (eq. 17) applied server-side."""
+    """Verify the half-step update formula (eq. 17) with HSIC normalization.
+
+    HSIC = (1/n²)||G||²_F, so ∇HSIC = (2/n²)·Σᵢ gᵢ.
+    ω_{t+1/2} = ω_t − η·λ·(2/n²)·Σᵢ gᵢ
+    """
 
     def test_half_step_update_single_client(self):
-        """With one client, ω_{t+1/2} = ω_t − η·λ·g_i."""
+        """With one client, verify the normalized update formula."""
         loader = _make_loader()
         model = _fresh_model()
         G = _rand_G()
@@ -472,11 +491,13 @@ class TestFair2ServerAggregation:
         step_size = 0.05
         lambda_fair = 2.0
         weights = get_weights(model)
+        total_n = N_SAMPLES
 
-        omega_half = [w - step_size * lambda_fair * g for w, g in zip(weights, gi)]
+        omega_half = _server_half_step(weights, gi, total_n, step_size, lambda_fair)
 
+        hsic_scale = 2.0 / total_n ** 2
         for oh, w, g in zip(omega_half, weights, gi):
-            expected = w - step_size * lambda_fair * g
+            expected = w - step_size * lambda_fair * hsic_scale * g
             np.testing.assert_allclose(oh, expected, rtol=1e-6)
 
     def test_half_step_moves_in_gradient_direction(self):
@@ -488,14 +509,14 @@ class TestFair2ServerAggregation:
         gi = _compute_fair2_gradient(loader, model, G, mu_s, mu_f, D_DEFAULT, 1.0, 1.0, seed=7)
 
         weights = get_weights(model)
-        step_size, lambda_fair = 0.1, 1.0
-        omega_half = [w - step_size * lambda_fair * g for w, g in zip(weights, gi)]
+        # Use large λ to ensure update is detectable after 1/n² scaling
+        omega_half = _server_half_step(weights, gi, N_SAMPLES, step_size=1.0, lambda_fair=1000.0)
 
         any_changed = any(not np.allclose(oh, w) for oh, w in zip(omega_half, weights))
         assert any_changed
 
     def test_two_client_gradient_sum(self):
-        """Summing gradients from two clients and applying the update is correct."""
+        """Summing gradients from two clients and applying the normalized update."""
         loaders = [_make_loader(seed=0), _make_loader(seed=1)]
         model = _fresh_model()
         G = _rand_G()
@@ -514,12 +535,14 @@ class TestFair2ServerAggregation:
             for k, g in enumerate(gi):
                 sum_grad[k] += g.astype(np.float64)
 
+        total_n = 2 * N_SAMPLES  # two loaders
         step_size, lambda_fair = 0.01, 1.0
-        omega_half = [w - step_size * lambda_fair * g for w, g in zip(weights, sum_grad)]
+        omega_half = _server_half_step(weights, sum_grad, total_n, step_size, lambda_fair)
 
         # Verify manually
+        hsic_scale = 2.0 / total_n ** 2
         for oh, w, sg in zip(omega_half, weights, sum_grad):
-            np.testing.assert_allclose(oh, w - step_size * lambda_fair * sg, rtol=1e-6)
+            np.testing.assert_allclose(oh, w - step_size * lambda_fair * hsic_scale * sg, rtol=1e-6)
 
     def test_zero_step_leaves_weights_unchanged(self):
         """Step size 0 → ω_{t+1/2} = ω_t regardless of gradient."""
@@ -528,7 +551,7 @@ class TestFair2ServerAggregation:
         mu_s, mu_f = _zero_mu(), _zero_mu()
         gi = _compute_fair2_gradient(loader, model, _eye_G(), mu_s, mu_f, D_DEFAULT, 1.0, 1.0, seed=0)
         weights = get_weights(model)
-        omega_half = [w - 0.0 * g for w, g in zip(weights, gi)]
+        omega_half = _server_half_step(weights, gi, N_SAMPLES, step_size=0.0, lambda_fair=1.0)
         for oh, w in zip(omega_half, weights):
             np.testing.assert_array_equal(oh, w)
 
@@ -542,7 +565,7 @@ class TestFair2ServerAggregation:
         weights = get_weights(model)
 
         def delta(step):
-            oh = [w - step * g for w, g in zip(weights, gi)]
+            oh = _server_half_step(weights, gi, N_SAMPLES, step_size=step, lambda_fair=1.0)
             return float(np.sqrt(sum(np.sum((a - b) ** 2) for a, b in zip(oh, weights))))
 
         assert delta(0.1) < delta(1.0)
